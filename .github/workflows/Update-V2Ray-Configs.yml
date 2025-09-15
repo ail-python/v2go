@@ -1,0 +1,199 @@
+name: Update V2Ray Configs
+
+permissions:
+  contents: write
+  checks: read
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: 'Force update regardless of changes'
+        required: false
+        default: 'false'
+
+jobs:
+  update-configs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GO_VERSION: '1.21'
+      OUTPUT_DIR: './output'
+      PROTOCOL_DIR: './Splitted-By-Protocol'
+      BASE64_DIR: './Base64'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: 'Files/go.sum'
+
+      - name: Build and run Go aggregator
+        id: build-and-run
+        run: |
+          set -euo pipefail
+          echo "Building Go application at $(date -u '+%Y-%m-%d %H:%M:%S UTC')..."
+          cd Files || { echo "::error::'Files' directory not found"; exit 1; }
+          go mod tidy
+          go build -ldflags="-s -w" -o ../aggregator *.go || { echo "::error::Build failed"; exit 1; }
+          cd ..
+          echo "Starting config aggregation and sorting..."
+          ./aggregator || { echo "::error::Aggregator execution failed"; exit 1; }
+          echo "Config processing completed successfully!"
+          echo "OUTPUT_COUNT=$(ls -1 ${OUTPUT_DIR}/*.txt 2>/dev/null | wc -l)" >> $GITHUB_OUTPUT
+
+      - name: Verify output files
+        run: |
+          set -euo pipefail
+          echo "Verifying generated files at $(date -u '+%Y-%m-%d %H:%M:%S UTC')..."
+          echo "Files in root directory:"
+          ls -la *.txt 2>/dev/null || echo "No .txt files found in root"
+          echo
+          echo "Protocol directory contents:"
+          ls -la ${PROTOCOL_DIR}/ 2>/dev/null || echo "No protocol directory found"
+          echo
+          echo "Sub files:"
+          ls -la Sub*.txt 2>/dev/null || echo "No Sub files found"
+          echo
+          echo "Base64 directory contents:"
+          ls -la ${BASE64_DIR}/ 2>/dev/null || echo "No Base64 directory found"
+          if [ -f "All_Configs_Sub.txt" ]; then
+            TOTAL_CONFIGS=$(wc -l < All_Configs_Sub.txt)
+            FILE_SIZE=$(du -h All_Configs_Sub.txt | cut -f1)
+            echo
+            echo "Main config file: $TOTAL_CONFIGS configurations ($FILE_SIZE)"
+          elif ls All_Configs_Sub_part_* >/dev/null 2>&1; then
+            TOTAL_CONFIGS=$(cat All_Configs_Sub_part_* | wc -l)
+            FILE_SIZE=$(du -ch All_Configs_Sub_part_* | grep total | cut -f1)
+            echo
+            echo "Main config file (split): $TOTAL_CONFIGS configurations ($FILE_SIZE total)"
+          else
+            echo
+            echo "Main config file not found - checking if it was split..."
+          fi
+          if [ -d "${PROTOCOL_DIR}" ]; then
+            echo
+            echo "Protocol file statistics:"
+            for file in ${PROTOCOL_DIR}/*.txt; do
+              if [ -f "$file" ]; then
+                count=$(wc -l < "$file")
+                size=$(du -h "$file" | cut -f1)
+                basename=$(basename "$file")
+                echo "  $basename: $count configs ($size)"
+              fi
+            done
+          fi
+
+      - name: Handle large files and prepare for commit
+        run: |
+          set -euo pipefail
+          echo "Checking file sizes and handling large files at $(date -u '+%Y-%m-%d %H:%M:%S UTC')..."
+          handle_large_file() {
+            local file="$1"
+            local prefix="$2"
+            local max_size_mb=90
+            if [ -f "$file" ]; then
+              if stat --version >/dev/null 2>&1; then
+                size=$(stat -c%s "$file")
+              else
+                size=$(stat -f%z "$file")
+              fi
+              size_mb=$((size / 1024 / 1024))
+              echo "File $file size: ${size_mb}MB"
+              if [ $size_mb -gt $max_size_mb ]; then
+                echo "Splitting large file: $file (size exceeds ${max_size_mb}MB)"
+                mkdir -p split_temp
+                split -b ${max_size_mb}M "$file" "split_temp/${prefix}_part_"
+                rm "$file"
+                mv split_temp/${prefix}_part_* .
+                rmdir split_temp
+                echo "File split into parts with prefix: ${prefix}_part_"
+              fi
+            fi
+          }
+          handle_large_file "All_Configs_Sub.txt" "All_Configs_Sub"
+          handle_large_file "All_Configs_base64_Sub.txt" "All_Configs_base64_Sub"
+          if [ -d "${PROTOCOL_DIR}" ]; then
+            for protocol_file in ${PROTOCOL_DIR}/*.txt; do
+              if [ -f "$protocol_file" ]; then
+                filename=$(basename "$protocol_file" .txt)
+                handle_large_file "$protocol_file" "${PROTOCOL_DIR}/${filename}"
+              fi
+            done
+          fi
+          for file in *_part_*; do
+            if [ -f "$file" ]; then
+              if stat --version >/dev/null 2>&1; then
+                size=$(stat -c%s "$file")
+              else
+                size=$(stat -f%z "$file")
+              fi
+              if [ "$size" -gt $((50 * 1024 * 1024)) ]; then
+                echo "Compressing $file..."
+                gzip -f "$file"
+              fi
+            fi
+          done
+
+      - name: Create status summary
+        run: |
+          set -euo pipefail
+          echo "# V2Ray Config Update Summary" > UPDATE_SUMMARY.md
+          echo "Generated on: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> UPDATE_SUMMARY.md
+          echo "" >> UPDATE_SUMMARY.md
+          echo "## Configuration Statistics" >> UPDATE_SUMMARY.md
+          total=0
+          if [ -f "All_Configs_Sub.txt" ]; then
+            total=$(wc -l < "All_Configs_Sub.txt")
+          elif ls All_Configs_Sub_part_* >/dev/null 2>&1; then
+            total=$(cat All_Configs_Sub_part_* | wc -l)
+          fi
+          echo "- Total configurations: $total" >> UPDATE_SUMMARY.md
+          if [ -d "${PROTOCOL_DIR}" ]; then
+            echo "- Protocol breakdown:" >> UPDATE_SUMMARY.md
+            for file in ${PROTOCOL_DIR}/*.txt; do
+              if [ -f "$file" ]; then
+                protocol=$(basename "$file" .txt)
+                count=$(wc -l < "$file")
+                echo "  - $protocol: $count configs" >> UPDATE_SUMMARY.md
+              fi
+            done
+          fi
+          echo "" >> UPDATE_SUMMARY.md
+          echo "## Performance" >> UPDATE_SUMMARY.md
+          echo "- Probing timeout per node: 5s" >> UPDATE_SUMMARY.md
+          echo "- Concurrency tuned by CPU count" >> UPDATE_SUMMARY.md
+          echo "" >> UPDATE_SUMMARY.md
+          echo "## System Info" >> UPDATE_SUMMARY.md
+          echo "- Runner: ${{ runner.os }} (${{ runner.arch }})" >> UPDATE_SUMMARY.md
+          echo "- Go Version: ${{ env.GO_VERSION }}" >> UPDATE_SUMMARY.md
+
+      - name: Commit and push changes
+        uses: EndBug/add-and-commit@v9
+        with:
+          author_name: "GitHub Actions Bot"
+          author_email: "github-actions[bot]@users.noreply.github.com"
+          message: "🚀 Fresh V2Ray Config Update [${{ github.run_id }}]"
+          add: "UPDATE_SUMMARY.md *.txt ${PROTOCOL_DIR}/* ${BASE64_DIR}/*"
+          default_author: github_actor
+          push: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Workflow failed at $(date -u '+%Y-%m-%d %H:%M:%S UTC'). Check logs for details."
+          exit 1

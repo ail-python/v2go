@@ -1,3 +1,3 @@
-module v2ray-config-aggregator
+module local/aggregator
 
 go 1.21
