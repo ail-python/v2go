@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -39,20 +38,15 @@ type ProbeResult struct {
 	OK bool
 }
 
-// ---------- Globals ----------
+// ---------- Sources ----------
 
-var userAgent = "Mozilla/5.0 (Aggregator; +https://github.com/) GoV2 Aggregator/1.0"
-
-var sources = []string{
-	// yasi-python sources
+var defaultSources = []string{
 	"https://raw.githubusercontent.com/yasi-python/PSGd/refs/heads/main/output/base64/mix",
 	"https://raw.githubusercontent.com/yasi-python/PSGS/refs/heads/main/subscriptions/xray/base64/mix",
 	"https://raw.githubusercontent.com/yasi-python/vip/refs/heads/master/sub/sub_merge_base64.txt",
-	// ail-python variants (in case those are the correct ones)
 	"https://raw.githubusercontent.com/ail-python/PSGd/refs/heads/main/output/base64/mix",
 	"https://raw.githubusercontent.com/ail-python/PSGS/refs/heads/main/subscriptions/xray/base64/mix",
 	"https://raw.githubusercontent.com/ail-python/vip/refs/heads/master/sub/sub_merge_base64.txt",
-	// popular public sources
 	"https://raw.githubusercontent.com/barry-far/V2ray-Config/refs/heads/main/All_Configs_base64_Sub.txt",
 	"https://raw.githubusercontent.com/mahdibland/V2RayAggregator/refs/heads/master/sub/sub_merge_base64.txt",
 	"https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/refs/heads/main/all_configs.txt",
@@ -60,11 +54,12 @@ var sources = []string{
 	"https://raw.githubusercontent.com/Danialsamadi/v2go/refs/heads/main/All_Configs_Sub.txt",
 }
 
+// ---------- Regex ----------
+
 var (
 	vmessRe   = regexp.MustCompile(`(?i)^vmess://`)
 	genericRe = regexp.MustCompile(`(?i)^(vless|trojan|ss|socks5?|hy2)://`)
-	// Extract tokens anywhere in text (greedy until whitespace)
-	tokenRe = regexp.MustCompile(`(?i)(vmess|vless|trojan|ss|socks5?|hy2)://[^\s]+`)
+	tokenRe   = regexp.MustCompile(`(?i)(vmess|vless|trojan|ss|socks5?|hy2)://[^\s]+`)
 )
 
 // ---------- Utils ----------
@@ -74,11 +69,51 @@ func logf(s string, a ...any) {
 	fmt.Printf("[%s] %s\n", ts, fmt.Sprintf(s, a...))
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+func getEnvString(name, def string) string {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		return v
 	}
-	return b
+	return def
+}
+
+func getEnvBool(name string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	if v == "" {
+		return def
+	}
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
+}
+
+func getEnvInt(name string, def int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return n
+	}
+	return def
+}
+
+func getEnvDuration(name string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return time.Duration(n) * time.Second
+	}
+	return def
 }
 
 func normalizeB64(s string) string {
@@ -86,13 +121,11 @@ func normalizeB64(s string) string {
 	s = strings.ReplaceAll(s, "\n", "")
 	s = strings.ReplaceAll(s, "\r", "")
 	s = strings.ReplaceAll(s, "\t", "")
-	// Remove URL-safe chars replacement; we'll try multiple decoders anyway
 	return s
 }
 
 func b64TryAll(s string) ([]byte, error) {
 	s = normalizeB64(s)
-	// pad for StdEncoding
 	if mod := len(s) % 4; mod != 0 {
 		s += strings.Repeat("=", 4-mod)
 	}
@@ -152,28 +185,25 @@ func uniqueStrings(in []string) []string {
 // ---------- Extraction ----------
 
 func ExtractNodesFromText(text string) []string {
-	// Try to decode whole-block base64 first
 	txt := maybeDecodeBigBase64Block(text)
 
-	out := make([]string, 0, 512)
+	out := make([]string, 0, 1024)
 	seen := map[string]struct{}{}
 
-	// 1) Regex token scan across full text
+	// Token scan
 	matches := tokenRe.FindAllString(txt, -1)
 	for _, m := range matches {
-		m = strings.TrimSpace(m)
+		m = strings.TrimSpace(strings.TrimRight(m, " \t\r\n,;"))
 		if m == "" {
 			continue
 		}
-		// strip trailing chars if any common junk got captured
-		m = strings.TrimRight(m, " \t\r\n,;")
 		if _, ok := seen[m]; !ok {
 			seen[m] = struct{}{}
 			out = append(out, m)
 		}
 	}
 
-	// 2) Line scan fallback
+	// Line scan fallback
 	lines := strings.Split(txt, "\n")
 	for _, raw := range lines {
 		r := strings.TrimSpace(raw)
@@ -204,19 +234,16 @@ func ExtractNodesFromText(text string) []string {
 // ---------- Parsing ----------
 
 func parseSSHostPort(raw string) (host string, port int) {
-	// Handle both ss://base64(method:password@host:port) and ss://method:password@host:port
 	s := strings.TrimSpace(raw)
 	if !strings.HasPrefix(strings.ToLower(s), "ss://") {
 		return "", 0
 	}
-	body := s[5:] // after ss://
-	// split by '#', '?' as they may be suffix tags
+	body := s[5:]
 	stop := len(body)
 	if idx := strings.IndexAny(body, "#?"); idx >= 0 {
 		stop = idx
 	}
 	core := body[:stop]
-	// If it contains '@' then url.Parse can get host:port
 	if strings.Contains(core, "@") {
 		if u, err := url.Parse(s); err == nil {
 			if h := u.Hostname(); h != "" {
@@ -230,33 +257,15 @@ func parseSSHostPort(raw string) (host string, port int) {
 		}
 		return
 	}
-	// Otherwise core is base64-encoded "method:password@host:port"
 	if dec, err := b64TryAll(core); err == nil {
 		val := string(dec)
-		// find last '@' then host:port
 		at := strings.LastIndex(val, "@")
 		if at >= 0 && at < len(val)-1 {
 			hostport := val[at+1:]
-			if hp, err := url.Parse("ss://" + hostport); err == nil {
-				if h := hp.Hostname(); h != "" {
-					host = h
-				}
-				if p := hp.Port(); p != "" {
-					if v, _ := strconv.Atoi(p); v > 0 {
-						port = v
-					}
-				}
-			} else {
-				// fallback regex
-				re := regexp.MustCompile(`^(.*@)?([A-Za-z0-9\.\-:]+)$`)
-				if m := re.FindStringSubmatch(hostport); len(m) == 3 {
-					hp2 := m[2]
-					if i := strings.LastIndex(hp2, ":"); i > 0 && i < len(hp2)-1 {
-						host = hp2[:i]
-						if v, _ := strconv.Atoi(hp2[i+1:]); v > 0 {
-							port = v
-						}
-					}
+			if i := strings.LastIndex(hostport, ":"); i > 0 && i < len(hostport)-1 {
+				host = hostport[:i]
+				if v, _ := strconv.Atoi(hostport[i+1:]); v > 0 {
+					port = v
 				}
 			}
 		}
@@ -290,26 +299,22 @@ func ParseNode(raw string) NodeMeta {
 				case float64:
 					n.Port = int(p)
 				}
-				// TLS flags
 				if v, ok := j["tls"].(string); ok && (strings.EqualFold(v, "tls") || v == "1" || strings.EqualFold(v, "true")) {
 					n.TLS = true
 				}
-				if v, ok := j["security"].(string); ok && strings.EqualFold(v, "tls") {
+				if v, ok := j["security"].(string); ok && (strings.EqualFold(v, "tls") || strings.EqualFold(v, "reality") || strings.Contains(strings.ToLower(v), "xtls")) {
 					n.TLS = true
 				}
-				// WS path
 				if v, ok := j["net"].(string); ok && strings.EqualFold(v, "ws") {
 					if pth, ok := j["path"].(string); ok {
 						n.Path = pth
 					}
 				}
-				// SNI
 				if v, ok := j["sni"].(string); ok && v != "" {
 					n.SNI = v
 				}
 			}
 		}
-		// Defaults
 		if n.Port == 0 {
 			if n.TLS {
 				n.Port = 443
@@ -334,7 +339,7 @@ func ParseNode(raw string) NodeMeta {
 				}
 			}
 			q := u.Query()
-			if v := q.Get("security"); strings.Contains(strings.ToLower(v), "tls") {
+			if v := q.Get("security"); strings.Contains(strings.ToLower(v), "tls") || strings.Contains(strings.ToLower(v), "reality") || strings.Contains(strings.ToLower(v), "xtls") {
 				n.TLS = true
 			}
 			if v := q.Get("encryption"); strings.Contains(strings.ToLower(v), "tls") {
@@ -349,7 +354,6 @@ func ParseNode(raw string) NodeMeta {
 			if v := q.Get("path"); v != "" {
 				n.Path = v
 			}
-			// Special handling for ss:// base64
 			if n.Proto == "ss" {
 				h, p := parseSSHostPort(n.Raw)
 				if h != "" {
@@ -360,7 +364,6 @@ func ParseNode(raw string) NodeMeta {
 				}
 			}
 		}
-		// defaults
 		if n.Port == 0 {
 			if n.TLS {
 				n.Port = 443
@@ -368,14 +371,13 @@ func ParseNode(raw string) NodeMeta {
 				n.Port = 80
 			}
 		}
-		// socks alias
 		if n.Proto == "socks" {
 			n.Proto = "socks5"
 		}
 		return n
 	}
 
-	// last-resort host:port extraction
+	// last-resort host:port
 	hostport := regexp.MustCompile(`([0-9a-zA-Z\.\-]+\.[a-zA-Z]{2,}|[0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{2,5})`)
 	if m := hostport.FindStringSubmatch(n.Raw); len(m) == 3 {
 		n.Host = m[1]
@@ -395,7 +397,7 @@ func dialTCP(ctx context.Context, host string, port int, timeout time.Duration) 
 		Timeout:   timeout,
 		KeepAlive: 10 * time.Second,
 	}
-	c, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", host, port))
+	c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return 0, err
 	}
@@ -418,7 +420,7 @@ func tlsHandshake(ctx context.Context, host string, port int, sni string, timeou
 		ServerName:         serverName,
 		MinVersion:         tls.VersionTLS12,
 	}
-	conn, err := tls.DialWithDialer(d, "tcp", fmt.Sprintf("%s:%d", host, port), cfg)
+	conn, err := tls.DialWithDialer(d, "tcp", net.JoinHostPort(host, strconv.Itoa(port)), cfg)
 	if err != nil {
 		return 0, err
 	}
@@ -426,32 +428,56 @@ func tlsHandshake(ctx context.Context, host string, port int, sni string, timeou
 	return time.Since(start), nil
 }
 
-func MultiLevelProbe(ctx context.Context, nm NodeMeta, timeout time.Duration) ProbeResult {
+func MultiLevelProbe(ctx context.Context, nm NodeMeta, quickTimeout, fullTimeout time.Duration, preferTLS, requireTLS bool) ProbeResult {
 	res := ProbeResult{OK: false}
-	// Candidate ports if missing were set in ParseNode
-	candidates := []int{nm.Port}
-	// If invalid port got set to <=0, try sane defaults
-	if nm.Port <= 0 {
-		if nm.TLS {
-			candidates = []int{443, 8443}
-		} else {
-			candidates = []int{80, 8080}
-		}
-	}
 
-	for _, p := range candidates {
-		_, err := dialTCP(ctx, nm.Host, p, timeout)
-		if err != nil {
-			continue
-		}
-		// If TLS node, require successful handshake too
-		if nm.TLS {
-			if _, err := tlsHandshake(ctx, nm.Host, p, nm.SNI, timeout); err != nil {
-				continue
+	// candidate ports (unique)
+	ports := []int{}
+	addPort := func(p int) {
+		for _, x := range ports {
+			if x == p {
+				return
 			}
 		}
-		res.OK = true
-		break
+		if p > 0 {
+			ports = append(ports, p)
+		}
+	}
+	addPort(nm.Port)
+	if nm.TLS {
+		addPort(443)
+		addPort(8443)
+	} else {
+		addPort(80)
+		addPort(8080)
+	}
+
+	for _, p := range ports {
+		// fast path
+		if _, err := dialTCP(ctx, nm.Host, p, quickTimeout); err == nil {
+			if nm.TLS && preferTLS {
+				if _, err := tlsHandshake(ctx, nm.Host, p, nm.SNI, fullTimeout); err != nil {
+					if requireTLS {
+						continue
+					}
+					// TLS failed but allowed: TCP was OK -> accept
+				}
+			}
+			res.OK = true
+			break
+		}
+		// slow path
+		if _, err := dialTCP(ctx, nm.Host, p, fullTimeout); err == nil {
+			if nm.TLS && preferTLS {
+				if _, err := tlsHandshake(ctx, nm.Host, p, nm.SNI, fullTimeout); err != nil {
+					if requireTLS {
+						continue
+					}
+				}
+			}
+			res.OK = true
+			break
+		}
 	}
 	return res
 }
@@ -477,8 +503,7 @@ func fetchURL(u string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", userAgent)
-
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Aggregator) GoV2/1.0")
 	resp, err := httpClient().Do(req)
 	if err != nil {
 		return "", err
@@ -510,127 +535,22 @@ func filepathDir(p string) string {
 	return "."
 }
 
-// ---------- Main ----------
-
-func main() {
-	start := time.Now()
-	logf("Starting aggregator and probe...")
-
-	// Concurrency limits
-	maxFetch := min(12, 4*runtime.NumCPU())
-	maxProbe := min(256, 64*runtime.NumCPU())
-	probeTimeout := 5 * time.Second
-
-	var (
-		allNodesMu sync.Mutex
-		allNodes   []string
-	)
-
-	// Fetch sources
-	logf("Fetching %d sources with concurrency=%d", len(sources), maxFetch)
-	fetchSem := make(chan struct{}, maxFetch)
-	var wgFetch sync.WaitGroup
-	for _, src := range sources {
-		wgFetch.Add(1)
-		fetchSem <- struct{}{}
-		go func(u string) {
-			defer wgFetch.Done()
-			defer func() { <-fetchSem }()
-			txt, err := fetchURL(u)
-			if err != nil {
-				logf("Fetch error %s: %v", u, err)
-				return
-			}
-			nodes := ExtractNodesFromText(txt)
-			if len(nodes) == 0 {
-				// attempt base64 decode of full content then re-extract
-				decoded := maybeDecodeBigBase64Block(txt)
-				if decoded != txt {
-					nodes = ExtractNodesFromText(decoded)
-				}
-			}
-			if len(nodes) > 0 {
-				allNodesMu.Lock()
-				allNodes = append(allNodes, nodes...)
-				allNodesMu.Unlock()
-				logf("Source OK: %s -> %d nodes", u, len(nodes))
-			} else {
-				logf("Source yielded zero nodes: %s", u)
-			}
-		}(src)
-	}
-	wgFetch.Wait()
-
-	if len(allNodes) == 0 {
-		logf("No nodes found from sources. Still writing empty outputs for workflow stability.")
-		writeOutputs([]string{})
-		summary(0, 0, time.Since(start))
-		return
-	}
-
-	// Unique
-	unique := uniqueStrings(allNodes)
-	logf("Collected %d nodes (%d unique)", len(allNodes), len(unique))
-
-	// Probe with worker pool
-	type item struct{ raw string }
-	inCh := make(chan item, len(unique))
-	for _, u := range unique {
-		inCh <- item{raw: u}
-	}
-	close(inCh)
-
-	var healthyMu sync.Mutex
-	healthy := make([]string, 0, len(unique)/2)
-	var checked int32
-
-	var wgProbe sync.WaitGroup
-	for i := 0; i < maxProbe; i++ {
-		wgProbe.Add(1)
-		go func() {
-			defer wgProbe.Done()
-			for it := range inCh {
-				atomic.AddInt32(&checked, 1)
-				nm := ParseNode(it.raw)
-				// only attempt probe if host looks sane
-				if nm.Host == "" || nm.Port <= 0 {
-					continue
-				}
-				ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-				res := MultiLevelProbe(ctx, nm, probeTimeout)
-				cancel()
-				if res.OK {
-					healthyMu.Lock()
-					healthy = append(healthy, it.raw)
-					healthyMu.Unlock()
-				}
-			}
-		}()
-	}
-	wgProbe.Wait()
-
-	// Stable order output
-	sort.Strings(healthy)
-	writeOutputs(healthy)
-	summary(len(unique), len(healthy), time.Since(start))
-}
-
 func writeOutputs(healthy []string) {
 	joined := strings.Join(healthy, "\n")
 	if joined != "" && !strings.HasSuffix(joined, "\n") {
 		joined += "\n"
 	}
 
-	// Root files (for GitHub Actions steps)
+	// Root files
 	_ = writeFile("All_Configs_Sub.txt", []byte(joined))
 	b64 := base64.StdEncoding.EncodeToString([]byte(joined))
 	_ = writeFile("All_Configs_base64_Sub.txt", []byte(b64))
 
-	// Output dir (extra)
+	// output/
 	_ = writeFile("output/merged_nodes.txt", []byte(joined))
 	_ = writeFile("output/merged_sub_base64.txt", []byte(b64))
 
-	// Split by protocol
+	// Split by protocol and prepare Base64 per-proto
 	byProto := map[string][]string{
 		"vmess":  {},
 		"vless":  {},
@@ -657,22 +577,202 @@ func writeOutputs(healthy []string) {
 	}
 }
 
-func summary(uniqueCount, healthyCount int, dur time.Duration) {
-	logf("Processed %d unique configs, %d healthy", uniqueCount, healthyCount)
-	logf("Outputs: All_Configs_Sub.txt, All_Configs_base64_Sub.txt, Splitted-By-Protocol/, Base64/, output/")
-	logf("Finished in %s", dur.Round(time.Millisecond))
+func loadSources() []string {
+	custom := strings.TrimSpace(os.Getenv("AGG_SOURCES_FILE"))
+	if custom == "" {
+		return defaultSources
+	}
+	data, err := os.ReadFile(custom)
+	if err != nil {
+		logf("Failed to read AGG_SOURCES_FILE=%s: %v, fallback to defaults", custom, err)
+		return defaultSources
+	}
+	out := []string{}
+	for _, ln := range strings.Split(string(data), "\n") {
+		s := strings.TrimSpace(ln)
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return defaultSources
+	}
+	return out
 }
 
-// ----- optional: Wilson lower bound kept here only for reference (not used) -----
-func wilsonLowerBound(success, total int, z float64) float64 {
+// ---------- Probe runner ----------
+
+func runProbe(unique []string, quickTimeout, fullTimeout time.Duration, maxProbe int, preferTLS, requireTLS bool, progressEvery int) []string {
+	total := len(unique)
 	if total == 0 {
-		return 0
+		return nil
 	}
-	n := float64(total)
-	p := float64(success) / n
-	z2 := z * z
-	den := 1 + z2/n
-	center := p + z2/(2*n)
-	rad := z * math.Sqrt((p*(1-p)+z2/(4*n))/n)
-	return (center - rad) / den
+	workers := maxProbe
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > total {
+		workers = total
+	}
+
+	type item struct{ raw string }
+	inCh := make(chan item, total)
+	for _, u := range unique {
+		inCh <- item{raw: u}
+	}
+	close(inCh)
+
+	var healthyMu sync.Mutex
+	healthy := make([]string, 0, total/3)
+	var checked int32
+	var healthyCount int32
+
+	var wgProbe sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wgProbe.Add(1)
+		go func() {
+			defer wgProbe.Done()
+			for it := range inCh {
+				idx := atomic.AddInt32(&checked, 1)
+				nm := ParseNode(it.raw)
+				if nm.Host == "" || nm.Port <= 0 {
+					continue
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), fullTimeout+quickTimeout)
+				res := MultiLevelProbe(ctx, nm, quickTimeout, fullTimeout, preferTLS, requireTLS)
+				cancel()
+				if res.OK {
+					healthyMu.Lock()
+					healthy = append(healthy, it.raw)
+					healthyMu.Unlock()
+					atomic.AddInt32(&healthyCount, 1)
+				}
+				if progressEvery > 0 && idx%int32(progressEvery) == 0 {
+					logf("Probed %d/%d, healthy=%d", idx, total, atomic.LoadInt32(&healthyCount))
+				}
+			}
+		}()
+	}
+	wgProbe.Wait()
+	return healthy
+}
+
+// ---------- Main ----------
+
+func main() {
+	start := time.Now()
+	logf("Starting aggregator + probe...")
+
+	// Env config
+	maxFetch := getEnvInt("AGG_MAX_FETCH", 12)
+	maxProbe := getEnvInt("AGG_MAX_PROBE", minInt(256, 64*runtime.NumCPU()))
+	quickTimeout := getEnvDuration("AGG_QUICK_TIMEOUT", 1200*time.Millisecond)
+	fullTimeout := getEnvDuration("AGG_PROBE_TIMEOUT", 4*time.Second)
+	noProbe := getEnvBool("AGG_NO_PROBE", false)
+	autoFallback := getEnvBool("AGG_AUTO_FALLBACK", true)
+	minHealthy := getEnvInt("AGG_MIN_HEALTHY_THRESHOLD", 50)
+	progressEvery := getEnvInt("AGG_PROGRESS_EVERY", 800)
+
+	// Strategy
+	strategy := strings.ToLower(getEnvString("AGG_PROBE_STRATEGY", "auto")) // auto | tcp | tcp+tls | tls | tls-only
+	preferTLS := true
+	requireTLS := false
+	switch strategy {
+	case "tcp":
+		preferTLS, requireTLS = false, false
+	case "tcp+tls", "auto":
+		preferTLS, requireTLS = true, false
+	case "tls", "tls-only":
+		preferTLS, requireTLS = true, true
+	}
+
+	// Fetch sources
+	sources := loadSources()
+	logf("Fetching %d sources with concurrency=%d", len(sources), maxFetch)
+	var allNodesMu sync.Mutex
+	allNodes := []string{}
+	fetchSem := make(chan struct{}, maxFetch)
+	var wgFetch sync.WaitGroup
+	for _, src := range sources {
+		wgFetch.Add(1)
+		fetchSem <- struct{}{}
+		go func(u string) {
+			defer wgFetch.Done()
+			defer func() { <-fetchSem }()
+			txt, err := fetchURL(u)
+			if err != nil {
+				logf("Fetch error %s: %v", u, err)
+				return
+			}
+			nodes := ExtractNodesFromText(txt)
+			if len(nodes) == 0 {
+				decoded := maybeDecodeBigBase64Block(txt)
+				if decoded != txt {
+					nodes = ExtractNodesFromText(decoded)
+				}
+			}
+			if len(nodes) > 0 {
+				allNodesMu.Lock()
+				allNodes = append(allNodes, nodes...)
+				allNodesMu.Unlock()
+				logf("Source OK: %s -> %d nodes", u, len(nodes))
+			} else {
+				logf("Source yielded zero nodes: %s", u)
+			}
+		}(src)
+	}
+	wgFetch.Wait()
+
+	if len(allNodes) == 0 {
+		logf("No nodes found. Writing empty outputs for stability.")
+		writeOutputs([]string{})
+		logf("Finished in %s", time.Since(start).Round(time.Millisecond))
+		return
+	}
+
+	unique := uniqueStrings(allNodes)
+	logf("Collected %d nodes (%d unique)", len(allNodes), len(unique))
+
+	var healthy []string
+
+	if noProbe {
+		logf("AGG_NO_PROBE=1 -> skipping probes, writing deduped list")
+		healthy = unique
+	} else {
+		healthy = runProbe(unique, quickTimeout, fullTimeout, maxProbe, preferTLS, requireTLS, progressEvery)
+		logf("Initial probe (strategy=%s) healthy=%d", strategy, len(healthy))
+
+		if autoFallback && len(healthy) < minHealthy {
+			// Fallback 1: TCP+TLS (optional TLS)
+			logf("Auto-fallback: too few healthy (<%d). Retrying with strategy=tcp+tls (optional TLS)", minHealthy)
+			healthy = runProbe(unique, quickTimeout, fullTimeout, maxProbe, true, false, progressEvery)
+			logf("Fallback tcp+tls healthy=%d", len(healthy))
+		}
+		if autoFallback && len(healthy) < minHealthy {
+			// Fallback 2: TCP-only
+			logf("Auto-fallback: still few. Retrying with strategy=tcp (TCP-only)")
+			healthy = runProbe(unique, quickTimeout, fullTimeout, maxProbe, false, false, progressEvery)
+			logf("Fallback tcp-only healthy=%d", len(healthy))
+		}
+		if autoFallback && len(healthy) < minHealthy {
+			// Fallback 3: No probe
+			logf("Auto-fallback: still few. Using deduped list without probing.")
+			healthy = unique
+		}
+	}
+
+	sort.Strings(healthy)
+	writeOutputs(healthy)
+
+	logf("Processed %d unique, %d output", len(unique), len(healthy))
+	logf("Outputs ready: All_Configs_Sub.txt, All_Configs_base64_Sub.txt, Splitted-By-Protocol/, Base64/, output/")
+	logf("Finished in %s", time.Since(start).Round(time.Millisecond))
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
