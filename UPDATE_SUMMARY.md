@@ -1,15 +1,15 @@
 # V2Ray Config Update Summary
-Generated on: 2025-09-15 18:53:41 UTC
+Generated on: 2025-09-16 03:10:06 UTC
 
 ## Configuration Statistics
-- Total configurations: 16940
+- Total configurations: 17726
 - Protocol breakdown:
   - socks5: 0 configs
-  - ss: 2831 configs
+  - ss: 3004 configs
   - ssr: 0 configs
-  - trojan: 723 configs
-  - vless: 11269 configs
-  - vmess: 2110 configs
+  - trojan: 561 configs
+  - vless: 12001 configs
+  - vmess: 2153 configs
 
 ## Performance
 - Probing timeout per node: 4-5s (quick+full)
